@@ -3,6 +3,7 @@ import { resolveObjectURL } from 'node:buffer';
 import test from 'node:test';
 import { useEffect } from 'react';
 import { getMultiPlateSettingsSnapshot, saveMultiPlateSettings } from '@/components/settings/multiPlatePreferences';
+import { PLATE_CASCADE_GAP_MM } from '@/features/scene/plates/plateCascade';
 import { clearHistory, getUndoCount, redo, undo } from '@/history/historyStore';
 import { getSnapshot as getSupportSnapshot, loadFromImportFormat, resetStore as resetSupportStore } from '@/supports/state';
 import { SUPPORT_COLLECTION_KEYS } from '@/supports/supportTypeRegistry';
@@ -210,6 +211,45 @@ test('adding beds in one go moves the supports of every model whose bed moves (#
   }
 });
 
+test('moving a model to another bed keeps its place on the bed, and a new bed is found in the same tick', async () => {
+  const orderingBefore = getMultiPlateSettingsSnapshot().plateOrdering;
+  saveMultiPlateSettings({ plateOrdering: 'dynamic' });
+  const { scene, loadCube, plateOf, positionOf, unmount } = await mountScene();
+
+  try {
+    const a = await loadCube('a.stl');
+    scene().addPlate();
+    await settle(20);
+    const plate3 = scene().addPlate();
+    await settle(20);
+    scene().addPlate();
+    await settle(20);
+    const frameOf = (plateId: string) => scene().plateFrames.find((frame) => frame.id === plateId)!;
+    const { widthMm, depthMm } = scene().view3dSettings;
+    // Four beds in a 2x2 grid: the third is the first of the second row.
+    assert.deepEqual(scene().plateOffsetFor(plate3), { dxMm: 0, dyMm: depthMm + PLATE_CASCADE_GAP_MM });
+    assert.deepEqual(scene().plateOffsetFor(plate3), { dxMm: frameOf(plate3).dxMm, dyMm: frameOf(plate3).dyMm });
+    assert.deepEqual(scene().plateOffsetFor('no-such-plate'), { dxMm: 0, dyMm: 0 }, 'an unknown plate reads as the first');
+
+    const before = positionOf(a);
+    scene().moveModelsToPlate([a], plate3);
+    await settle(50);
+    assert.equal(plateOf(a), plate3);
+    assert.deepEqual(positionOf(a), { x: before.x, y: before.y + depthMm + PLATE_CASCADE_GAP_MM }, 'same spot, next bed');
+
+    // A caller that adds beds places onto them before React renders again, so the
+    // lookup has to know the new bed straight away.
+    const { added, offsets } = scene().addPlates(1);
+    const fifth = added[0].id;
+    assert.deepEqual(scene().plateOffsetFor(fifth), offsets.get(fifth));
+    // Five beds make the grid 3x2: the fifth sits in the middle of the second row.
+    assert.deepEqual(offsets.get(fifth), { dxMm: widthMm + PLATE_CASCADE_GAP_MM, dyMm: depthMm + PLATE_CASCADE_GAP_MM });
+  } finally {
+    await unmount();
+    saveMultiPlateSettings({ plateOrdering: orderingBefore });
+  }
+});
+
 test('deleting the first plate takes its models and moves the other beds up a slot', async () => {
   const { scene, loadCube, plateOf, positionOf, rootOf, unmount } = await mountScene();
 
@@ -252,6 +292,46 @@ test('deleting the first plate takes its models and moves the other beds up a sl
     assert.equal(plateOf(a), plate1, 'undo brings the model back onto the first plate');
     for (const [id, plateId] of Object.entries(kept)) assert.equal(plateOf(id), plateId, 'and the others back onto theirs');
     for (const id of [a, c, d]) assert.deepEqual(rootOf(id), rootsBefore[id], 'supports included');
+  } finally {
+    await unmount();
+  }
+});
+
+test('deleting the first of two plates brings the model on the second onto the bed that is left', async () => {
+  const { scene, loadCube, plateOf, positionOf, rootOf, unmount } = await mountScene();
+
+  try {
+    const a = await loadCube('a.stl');
+    const c = await loadCube('c.stl');
+    const plate1 = plateOf(a);
+    const plate2 = scene().addPlate();
+    await settle(20);
+    scene().moveModelsToPlate([c], plate2);
+    await settle(50);
+    assert.equal(plateOf(c), plate2, 'set up as described');
+    resetSupportStore();
+    loadFromImportFormat(rootsUnder([a, c].map((id) => ({ id, ...positionOf(id) }))));
+    const before = { position: positionOf(c), root: rootOf(c) };
+
+    clearHistory();
+    assert.equal(scene().removePlate(plate1), true, 'the first plate can go');
+    await waitFor(() => scene().plates.length === 1, 'the plate to go');
+    await settle(100);
+
+    const frame = scene().plateFrames.find((candidate) => candidate.id === plate2)!;
+    const { x, y } = positionOf(c);
+    assert.ok(
+      x >= frame.minX && x <= frame.maxX && y >= frame.minY && y <= frame.maxY,
+      `the model stands on the bed that is left (at ${x}, ${y})`,
+    );
+    assert.notDeepEqual(positionOf(c), before.position, 'it moved with its bed');
+    assert.deepEqual(rootOf(c), positionOf(c), 'and its supports with it');
+
+    undo();
+    await waitFor(() => scene().plates.length === 2, 'undo to bring the plate back');
+    await settle(100);
+    assert.deepEqual(positionOf(c), before.position, 'undo puts it back');
+    assert.deepEqual(rootOf(c), before.root, 'supports included');
   } finally {
     await unmount();
   }
